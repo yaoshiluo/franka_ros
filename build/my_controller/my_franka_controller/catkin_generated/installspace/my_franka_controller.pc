@@ -1,0 +1,8 @@
+prefix=/home/ubuntu/franka_ros_ws/install
+
+Name: my_franka_controller
+Description: Description of my_franka_controller
+Version: 0.0.0
+Cflags: -I${prefix}/include
+Libs: -L${prefix}/lib -lmy_controller
+Requires: controller_interface hardware_interface pluginlib roscpp

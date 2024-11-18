@@ -1,0 +1,10 @@
+<?xml version="1.0"?>
+<library path="lib/libmy_controller">
+  <class name="my_franka_controller/MyController"
+         type="my_franka_controller::MyController"
+         base_class_type="controller_interface::ControllerBase">
+    <description>
+      This controller performs Cartesian impedance control for the Franka robot.
+    </description>
+  </class>
+</library>
