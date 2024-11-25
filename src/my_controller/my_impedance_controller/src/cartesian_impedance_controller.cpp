@@ -16,7 +16,7 @@ namespace my_impedance_controller {
         std::vector<double> cartesian_stiffness_vector;
         std::vector<double> cartesian_damping_vector;
 
-        sub_equilibrium_pose_ = node_handle::subscribe(
+        sub_equilibrium_pose_ = node_handle.subscribe(
             "equilibrium_pose", 20, &CartesianImpedanceController::equilibriumPoseCallback, this,
             ros::TransportHints().reliable().tcpNoDelay());
 
@@ -53,12 +53,12 @@ namespace my_impedance_controller {
             try{
                 joint_handles_.push_back(effort_joint_interface->getHandle(joint_names[i]));
             } catch (const hardware_interface::HardwareInterfaceException& ex) {
-                EOS_ERROR_STREAM("CartesianImpedanceController: Expection getting joint handles: " << ex.what())
+                ROS_ERROR_STREAM("CartesianImpedanceController: Expection getting joint handles: " << ex.what());
                 return false;
             }
         }
 
-        dynamic_reconfifure_compliance_param_node_ = 
+        dynamic_reconfigure_compliance_param_node_ = 
             ros::NodeHandle(node_handle.getNamespace() + "dynamic_reconfigure_compliance_param_node");
 
         dynamic_server_compliance_param_ = std::make_unique<dynamic_reconfigure::Server<my_impedance_controller::compliance_paramConfig>>(
@@ -75,7 +75,7 @@ namespace my_impedance_controller {
         cartesian_stiffness_.setZero();
         cartesian_damping_.setZero();
                          
-        return ture;                   
+        return true;                   
     }
 
     void CartesianImpedanceController::starting(const ros::Time&) {
@@ -87,8 +87,31 @@ namespace my_impedance_controller {
 
         Eigen::Map<Eigen::Matrix<double, 7,1>> q_initial(initial_state.q.data());
         Eigen::Affine3d initial_transform(Eigen::Matrix4d::Map(initial_state.O_T_EE.data()));
+        
+        position_d_ = initial_transform.translation();
+        orientation_d_ = Eigen::Quaterniond(initial_transform.rotation());
+        position_d_target_ = initial_transform.translation();
+        orientation_d_target_ = Eigen::Quaterniond(initial_transform.rotation());
+
+        q_d_nullspace_ = q_initial;
+    }
+        
+    void CartesianImpedanceController::update(const ros::Time&,
+                                              const ros::Duration&) {
+        
+        franka::RobotState robot_state = state_handle_->getRobotState();
+        std::array<double, 7> coriolis_array = model_handle_->getCoriolis();
+        std::array<double, 42> jacobian_array = model_handle_->getZeroJacobian(franka::Frame::kEndEffector);
+
+        Eigen::Map<Eigen::Matrix<double, 7, 1>> coriolis(coriolis_array.data());
+        Eigen::Map<Eigen::Matrix<double, 6, 7>> jacobian(jacobian_array.data());
+        Eigen::Map<Eigen::Matrix<double, 7, 1>> q(robot_state.q.data());
+        Eigen::Map<Eigen::Matrix<double, 7, 1>> dq(robot_state.dq.data());
+        Eigen::Map<Eigen::Matrix<double, 7, 1>> tau_J_d(robot_state.tau_J_d.data());
+        
+        Eigen::Affine3d transform(Eigen::Matrix4d::Map(robot_state.O_T_EE.data()));
         Eigen::Vector3d position(transform.translation());
-        Eigen::Quaternion orientation(transform.rotation());
+        Eigen::Quaterniond orientation(transform.rotation());
 
         Eigen::Matrix<double, 6, 1>error;
         error.head(3) << position - position_d_;
@@ -102,8 +125,10 @@ namespace my_impedance_controller {
 
         // 姿态误差需转换到base frame,位置误差不需要
         error.tail(3) << -transform.rotation() * error.tail(3);
+        
+        Eigen::VectorXd tau_task(7), tau_nullspace(7), tau_d(7);
 
-        Eigen::VectorXd jacobian_transpose_pinv;
+        Eigen::MatrixXd jacobian_transpose_pinv;
         pseudoInverse(jacobian.transpose(), jacobian_transpose_pinv);
 
         //Cartesian PD control
@@ -152,5 +177,34 @@ namespace my_impedance_controller {
         return tau_d_saturated;
         }
 
+    void CartesianImpedanceController::complianceParamCallback(
+          my_impedance_controller::compliance_paramConfig& config,
+          uint32_t) {
+        
+        cartesian_stiffness_target_.setIdentity();
+        cartesian_stiffness_target_.topLeftCorner(3, 3) << config.translational_stiffness * Eigen::Matrix3d::Identity();
+        cartesian_stiffness_target_.bottomRightCorner(3, 3) << config.rotational_stiffness * Eigen::Matrix3d::Identity();
+        cartesian_damping_target_.setIdentity();
+
+        cartesian_damping_target_.topLeftCorner(3, 3) << 2.0 * sqrt(config.translational_stiffness) * Eigen::Matrix3d::Identity();
+        cartesian_damping_target_.bottomRightCorner(3, 3) << 2.0 * sqrt(config.rotational_stiffness) * Eigen::Matrix3d::Identity();
+
+        nullspace_stiffness_target_ = config.nullspace_stiffness;
+
+        }
+
+    void CartesianImpedanceController::equilibriumPoseCallback(const geometry_msgs::PoseStampedConstPtr& msg) {
+        std::lock_guard<std::mutex> position_d_target_mutex_lock(position_and_orientation_d_target_mutex_);
+        position_d_target_ << msg->pose.position.x, msg->pose.position.y, msg->pose.position.z;
+        Eigen::Quaterniond last_orientation_d_target(orientation_d_target_);
+        orientation_d_target_.coeffs() << msg->pose.orientation.x, msg->pose.orientation.y, msg->pose.orientation.z, msg->pose.orientation.w;
+
+        if (last_orientation_d_target.coeffs().dot(orientation_d_target_.coeffs()) < 0.0) {
+            orientation_d_target_.coeffs() << -orientation_d_target_.coeffs(); 
+        } 
+    }
+
     
 }
+PLUGINLIB_EXPORT_CLASS(my_impedance_controller::CartesianImpedanceController,
+                        controller_interface::ControllerBase)
